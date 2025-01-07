@@ -1,2 +1,2 @@
-# aiorefoss
-HomeAssistant Refoss  RPC  Dependency
+# Contact information
+- support@refoss.net
