@@ -42,7 +42,7 @@ _LOGGER = logging.getLogger(__name__)
 def mergedicts(dest: dict, source: dict) -> None:
     """Deep dicts merge."""
     for k, v in source.items():
-        if k in dest and type(v) is dict:  # - only accepts `dict` type
+        if k in dest and isinstance(v, dict):  # - only accepts `dict` type
             mergedicts(dest[k], v)
         else:
             dest[k] = v
@@ -121,7 +121,6 @@ class RpcDevice:
         # inform listener that device is online
         if not self.initialized and not self._initializing:
             self._update_listener(self, RpcUpdateType.ONLINE)
-            return
 
         # If the device isn't initialized, avoid sending updates
         # as it may be in the process of initializing.
@@ -320,7 +319,7 @@ class RpcDevice:
         if "auth_en" not in self.refoss:
             raise WrongRefoss
 
-        return bool(self.refoss["auth_en"])
+        return bool(self.refoss.get("auth_en", False))
 
     async def call_rpc(
         self, method: str, params: dict[str, Any] | None = None
@@ -341,7 +340,7 @@ class RpcDevice:
             raise
         except CONNECT_ERRORS as err:
             self._last_error = DeviceConnectionError(err)
-            raise DeviceConnectionError from err
+            raise self._last_error from err
 
     @property
     def status(self) -> dict[str, Any]:
@@ -350,7 +349,7 @@ class RpcDevice:
             raise NotInitialized
 
         if self._status is None:
-            raise InvalidAuthError
+            raise NotInitialized("Device status not available, initialization may have failed")
 
         return self._status
 
@@ -369,7 +368,7 @@ class RpcDevice:
             raise NotInitialized
 
         if self._config is None:
-            raise InvalidAuthError
+            raise NotInitialized("Device config not available, initialization may have failed")
 
         return self._config
 
@@ -414,7 +413,8 @@ class RpcDevice:
     @property
     def name(self) -> str:
         """Device name."""
-        return cast(str, self.refoss.get("name") or self.hostname)
+        name = self.refoss.get("name", "")
+        return cast(str, name) if name else self.hostname
 
     @property
     def connected(self) -> bool:

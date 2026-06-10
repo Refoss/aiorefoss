@@ -3,7 +3,7 @@
 This library provides async support for Refoss smart devices using WebSocket.
 """
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 from .common import ConnectionOptions, IpOrOptionsType, get_info, process_ip_or_options
 from .exceptions import (

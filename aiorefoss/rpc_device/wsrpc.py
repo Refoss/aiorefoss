@@ -168,17 +168,6 @@ class RPCCall:
             f"call_id={self.call_id} result={self.result!r}>"
         )
 
-    def __repr__(self) -> str:
-        """Return representation of the call."""
-        return (
-            "<RPCCall "
-            f"method={self.method} "
-            f"params={self.params} "
-            f"call_id={self.call_id} "
-            f"result={self.result}"
-            ">"
-        )
-
     @property
     def request_frame(self) -> dict[str, Any]:
         """Request frame."""
@@ -469,11 +458,13 @@ class WsRPC(WsBase):
             return [call.result for call in results]  # type: ignore[misc]
 
         # Partial success, try to update auth and retry
-        to_retry: list[RPCCall] = []
-        successful: list[dict[str, Any]] = []
-        for call in results:
+        # Use a dictionary to preserve call order by index
+        results_by_index: dict[int, dict[str, Any]] = {}
+        to_retry: list[tuple[int, RPCCall]] = []
+        
+        for idx, call in enumerate(results):
             if (result := call.result) is not UNDEFINED:
-                successful.append(result)
+                results_by_index[idx] = result
                 continue
             resp = call.resolve.result()
             self._raise_for_unrecoverable_errors(resp, allow_auth_retry=True)
@@ -505,27 +496,29 @@ class WsRPC(WsBase):
                         HTTPStatus.UNAUTHORIZED.value, "Invalid auth challenge format"
                     ) from err
                 self._session.auth = self._auth_data.get_auth(nonce, nc)
-            to_retry.append(call)
+            to_retry.append((idx, call))
 
-        _, results = await self._rpc_calls(
-            [(call.method, call.params) for call in to_retry], timeout
-        )
+        if to_retry:
+            _, retry_results = await self._rpc_calls(
+                [(call.method, call.params) for _, call in to_retry], timeout
+            )
 
-        for call in results:
-            if (result := call.result) is UNDEFINED:
-                resp = call.resolve.result()
-                _LOGGER.warning(
-                    "host %s:%s: RPC call retry failed: method=%s, error=%s",
-                    self._ip_address,
-                    self._port,
-                    call.method,
-                    resp.get("error"),
-                )
-                self._raise_for_unrecoverable_errors(resp, allow_auth_retry=False)
-            else:
-                successful.append(result)
+            for (idx, original_call), retry_call in zip(to_retry, retry_results):
+                if (result := retry_call.result) is UNDEFINED:
+                    resp = retry_call.resolve.result()
+                    _LOGGER.warning(
+                        "host %s:%s: RPC call retry failed: method=%s, error=%s",
+                        self._ip_address,
+                        self._port,
+                        original_call.method,
+                        resp.get("error"),
+                    )
+                    self._raise_for_unrecoverable_errors(resp, allow_auth_retry=False)
+                else:
+                    results_by_index[idx] = result
 
-        return successful
+        # Return results in original call order
+        return [results_by_index[idx] for idx in range(len(call_list))]
 
     async def _rpc_calls(
         self, rpc_calls: Iterable[tuple[str, dict[str, Any] | None]], timeout: float
@@ -559,9 +552,9 @@ class WsRPC(WsBase):
         except (TimeoutError, Exception) as exc:
             # Clean up on any exception (timeout, connection close, etc.)
             for call in sent_calls:
-                with contextlib.suppress(asyncio.CancelledError, asyncio.InvalidStateError):
-                    if not call.resolve.done():
-                        call.resolve.cancel()
+                if not call.resolve.done():
+                    call.resolve.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, asyncio.InvalidStateError):
                         await call.resolve
                 # Ensure the call is removed from the calls dict on failure
                 self._calls.pop(call.call_id, None)
