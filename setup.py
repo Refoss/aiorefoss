@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="aiorefoss",
-    version="1.0.1",
+    version="1.0.2",
     author="ashionky",
     author_email="495519020@qq.com",
     classifiers=[

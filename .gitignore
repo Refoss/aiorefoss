@@ -1,5 +1,35 @@
+# Virtual environments
+venv/
+venv_*/
+.venv/
+env/
+
+# Build artifacts
 /dist
-/build/*
-.idea
-/aiorefoss.egg-info/*
-test/
+/build/
+*.egg-info/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

@@ -61,6 +61,11 @@ def _receive_json_or_raise(msg: WSMessage) -> dict[str, Any]:
         try:
             data: dict[str, Any] = json_loads(msg.data)
         except ValueError as err:
+            _LOGGER.debug(
+                "JSON parse error: data=%s, error=%s",
+                msg.data[:200] if msg.data else None,
+                err,
+            )
             raise InvalidMessage(f"Received invalid JSON: {msg.data}") from err
         return data
 
@@ -68,8 +73,10 @@ def _receive_json_or_raise(msg: WSMessage) -> dict[str, Any]:
         raise ConnectionClosed("Connection was closed.")
 
     if msg.type is WSMsgType.ERROR:
+        _LOGGER.error("WebSocket error message received")
         raise InvalidMessage("Received message error")
 
+    _LOGGER.warning("Unexpected WebSocket message type: %s", msg.type)
     raise InvalidMessage(f"Received non-Text message: {msg.type}")
 
 
@@ -157,6 +164,13 @@ class RPCCall:
     def __repr__(self) -> str:
         """Return representation of the call."""
         return (
+            f"<RPCCall method={self.method!r} params={self.params!r} "
+            f"call_id={self.call_id} result={self.result!r}>"
+        )
+
+    def __repr__(self) -> str:
+        """Return representation of the call."""
+        return (
             "<RPCCall "
             f"method={self.method} "
             f"params={self.params} "
@@ -214,7 +228,11 @@ class WsRPC(WsBase):
         self._calls: dict[int, RPCCall] = {}
         self._call_id = 0
         self._session = SessionData(f"aios-{id(self)}", None, None)
-        self._loop = asyncio.get_running_loop()
+
+    @property
+    def _loop(self) -> asyncio.AbstractEventLoop:
+        """Get current running event loop."""
+        return asyncio.get_running_loop()
 
     @property
     def _next_id(self) -> int:
@@ -224,20 +242,37 @@ class WsRPC(WsBase):
     async def connect(self, aiohttp_session: ClientSession) -> None:
         """Connect to device."""
         if self.connected:
+            _LOGGER.warning(
+                "host %s:%s: Connection attempt while already connected",
+                self._ip_address,
+                self._port,
+            )
             raise RuntimeError("Already connected")
 
-        _LOGGER.debug("Trying to connect to device at %s", self._ip_address)
+        ws_url = URL.build(
+            scheme="http", host=self._ip_address, port=self._port, path="/rpc"
+        )
         try:
             self._client = await aiohttp_session.ws_connect(
-                URL.build(
-                    scheme="http", host=self._ip_address, port=self._port, path="/rpc"
-                ),
+                ws_url,
                 heartbeat=WS_HEARTBEAT,
             )
-        except (
-            client_exceptions.WSServerHandshakeError,
-            client_exceptions.ClientError,
-        ) as err:
+        except client_exceptions.WSServerHandshakeError as err:
+            _LOGGER.warning(
+                "host %s:%s: WebSocket handshake failed: status=%s, message=%s",
+                self._ip_address,
+                self._port,
+                getattr(err, "status", "unknown"),
+                str(err)[:200],
+            )
+            raise DeviceConnectionError(err) from err
+        except client_exceptions.ClientError as err:
+            _LOGGER.warning(
+                "host %s:%s: WebSocket client error: %s",
+                self._ip_address,
+                self._port,
+                str(err)[:200],
+            )
             raise DeviceConnectionError(err) from err
 
         sock: socket.socket = self._client.get_extra_info("socket")
@@ -245,7 +280,7 @@ class WsRPC(WsBase):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)
         except OSError as err:
             _LOGGER.warning(
-                "%s:%s: Failed to set socket receive buffer size: %s",
+                "host %s:%s: Failed to set socket receive buffer size: %s",
                 self._ip_address,
                 self._port,
                 err,
@@ -314,11 +349,11 @@ class WsRPC(WsBase):
             # looks like a response
             if (call := self._calls.pop(frame_id, None)) is None:
                 _LOGGER.warning(
-                    "Response from (%s:%s) for an unknown request id: %s: %s",
+                    "Response from (%s:%s) for an unknown request id: %s, frame=%s",
                     self._ip_address,
                     self._port,
                     frame_id,
-                    method,
+                    frame,
                 )
                 return
 
@@ -327,7 +362,12 @@ class WsRPC(WsBase):
 
             return
 
-        _LOGGER.warning("Invalid frame: %s", frame)
+        _LOGGER.warning(
+            "Invalid frame format from (%s:%s): %s",
+            self._ip_address,
+            self._port,
+            frame,
+        )
 
     async def _rx_msgs(self) -> None:
         if TYPE_CHECKING:
@@ -335,8 +375,8 @@ class WsRPC(WsBase):
 
         try:
             while True:
+                msg = await self._client.receive()
                 try:
-                    msg = await self._client.receive()
                     frame = _receive_json_or_raise(msg)
                     _LOGGER.debug(
                         "recv(%s:%s): %s", self._ip_address, self._port, frame
@@ -348,6 +388,7 @@ class WsRPC(WsBase):
                         self._port,
                         err,
                     )
+                    continue  # Skip to next message on invalid frame
                 except ConnectionClosed:
                     break
                 except Exception:
@@ -400,10 +441,10 @@ class WsRPC(WsBase):
         """Raise for unrecoverable errors."""
         try:
             error = resp["error"]
-            code = error["code"]
-            msg = error["message"]
-        except KeyError as err:
-            raise RpcCallError(0, f"bad response: {resp}") from err
+            code = error.get("code", 0)
+            msg = error.get("message", str(error))
+        except (KeyError, TypeError) as err:
+            raise RpcCallError(0, f"bad response format: {resp}") from err
 
         if code != HTTPStatus.UNAUTHORIZED.value:
             raise RpcCallError(code, msg)
@@ -418,7 +459,8 @@ class WsRPC(WsBase):
     ) -> list[dict[str, Any]]:
         """Websocket RPC calls."""
         # Try request with initial/last call auth data
-        all_successful, results = await self._rpc_calls(calls, timeout)
+        call_list = list(calls)
+        all_successful, results = await self._rpc_calls(call_list, timeout)
         if all_successful:
             # If all_successful, return results immediately
             # mypy does not know that .result is never
@@ -438,21 +480,47 @@ class WsRPC(WsBase):
             if not to_retry:
                 # Update auth from response and try with new auth data
                 # If we have multiple calls, we only need to update auth once
-                if TYPE_CHECKING:
-                    # _raise_for_unrecoverable_errors ensures that auth_data is not None
-                    assert self._auth_data is not None
-                auth = json_loads(resp["error"]["message"])
-                self._session.auth = self._auth_data.get_auth(
-                    auth["nonce"], auth.get("nc", 1)
-                )
+                if self._auth_data is None:
+                    # This should not happen as _raise_for_unrecoverable_errors checks it
+                    # But we handle it gracefully just in case
+                    _LOGGER.error(
+                        "host %s:%s: Auth retry required but no auth data configured",
+                        self._ip_address,
+                        self._port,
+                    )
+                    raise InvalidAuthError("Authentication data not configured")
+                try:
+                    auth = json_loads(resp["error"]["message"])
+                    nonce = auth["nonce"]
+                    nc = auth.get("nc", 1)
+                except (KeyError, ValueError) as err:
+                    _LOGGER.error(
+                        "host %s:%s: Failed to parse auth challenge from response: %s, error: %s",
+                        self._ip_address,
+                        self._port,
+                        resp,
+                        err,
+                    )
+                    raise RpcCallError(
+                        HTTPStatus.UNAUTHORIZED.value, "Invalid auth challenge format"
+                    ) from err
+                self._session.auth = self._auth_data.get_auth(nonce, nc)
             to_retry.append(call)
 
         _, results = await self._rpc_calls(
             [(call.method, call.params) for call in to_retry], timeout
         )
+
         for call in results:
             if (result := call.result) is UNDEFINED:
                 resp = call.resolve.result()
+                _LOGGER.warning(
+                    "host %s:%s: RPC call retry failed: method=%s, error=%s",
+                    self._ip_address,
+                    self._port,
+                    call.method,
+                    resp.get("error"),
+                )
                 self._raise_for_unrecoverable_errors(resp, allow_auth_retry=False)
             else:
                 successful.append(result)
@@ -488,15 +556,22 @@ class WsRPC(WsBase):
                         all_successful = False
                         continue
                     call.result = response["result"]
-        except TimeoutError as exc:
+        except (TimeoutError, Exception) as exc:
+            # Clean up on any exception (timeout, connection close, etc.)
             for call in sent_calls:
-                with contextlib.suppress(asyncio.CancelledError):
-                    call.resolve.cancel()
-                    await call.resolve
-                # Ensure the call is removed from the calls dict
-                # on failure
+                with contextlib.suppress(asyncio.CancelledError, asyncio.InvalidStateError):
+                    if not call.resolve.done():
+                        call.resolve.cancel()
+                        await call.resolve
+                # Ensure the call is removed from the calls dict on failure
                 self._calls.pop(call.call_id, None)
-            raise DeviceConnectionTimeoutError(sent_calls) from exc
+            if isinstance(exc, TimeoutError):
+                raise DeviceConnectionTimeoutError(sent_calls) from exc
+            raise  # Re-raise other exceptions (DeviceConnectionError, etc.)
+
+        # Clean up calls dict on success path
+        for call in sent_calls:
+            self._calls.pop(call.call_id, None)
 
         if _LOGGER.isEnabledFor(logging.DEBUG):
             for call in sent_calls:
@@ -515,7 +590,16 @@ class WsRPC(WsBase):
         """Send json frame to device."""
         _LOGGER.debug("send(%s:%s): %s", self._ip_address, self._port, data)
 
-        if TYPE_CHECKING:
-            assert self._client
+        if self._client is None or self._client.closed:
+            raise DeviceConnectionError("WebSocket connection is not available")
 
-        await self._client.send_frame(json_bytes(data), WSMsgType.TEXT)
+        try:
+            await self._client.send_frame(json_bytes(data), WSMsgType.TEXT)
+        except (ConnectionError, RuntimeError) as err:
+            _LOGGER.debug(
+                "Failed to send message to %s:%s: %s",
+                self._ip_address,
+                self._port,
+                err,
+            )
+            raise DeviceConnectionError("Failed to send message") from err

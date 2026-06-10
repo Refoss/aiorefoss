@@ -24,6 +24,7 @@ from ..const import (
 )
 from ..exceptions import (
     DeviceConnectionError,
+    DeviceConnectionTimeoutError,
     InvalidAuthError,
     MacAddressMismatchError,
     NotInitialized,
@@ -31,6 +32,7 @@ from ..exceptions import (
     RefossError,
     WrongRefoss,
 )
+from ..json import json_loads
 
 from .wsrpc import RPCSource, WsRPC
 
@@ -166,26 +168,48 @@ class RpcDevice:
                 await self._wsrpc.connect(self.aiohttp_session)
             await self._init_calls()
         except InvalidAuthError as err:
-            self._last_error = InvalidAuthError(err)
-            _LOGGER.debug("host %s:%s: error: %r", ip, port, self._last_error)
+            self._last_error = err
+            _LOGGER.warning(
+                "host %s:%s: Authentication failed: %s",
+                ip,
+                port,
+                str(err)[:200],
+            )
             await self._wsrpc.disconnect()
             raise
         except MacAddressMismatchError as err:
             self._last_error = err
-            _LOGGER.debug("host %s:%s: error: %r", ip, port, err)
+            _LOGGER.warning(
+                "host %s:%s: MAC address mismatch: %s",
+                ip,
+                port,
+                err,
+            )
             await self._wsrpc.disconnect()
             raise
+        except TimeoutError as err:
+            self._last_error = DeviceConnectionTimeoutError(err)
+            _LOGGER.warning(
+                "host %s:%s: Connection timeout after %ss: %r",
+                ip,
+                port,
+                DEVICE_IO_TIMEOUT,
+                err,
+            )
+            await self._wsrpc.disconnect()
+            raise self._last_error from err
         except (*CONNECT_ERRORS, RpcCallError) as err:
             self._last_error = DeviceConnectionError(err)
-            _LOGGER.debug("host %s:%s: error: %r", ip, port, self._last_error)
+            _LOGGER.warning(
+                "host %s:%s: Connection error: %r",
+                ip,
+                port,
+                self._last_error,
+            )
             await self._wsrpc.disconnect()
             raise self._last_error from err
         else:
-            _LOGGER.debug("host %s:%s: RPC device init finished", ip, port)
             self.initialized = True
-        _LOGGER.debug("device %s info:%s,", self.name, self.refoss)
-        _LOGGER.debug("device %s status:%s,", self.name, self.status)
-        _LOGGER.debug("device %s config:%s,", self.name, self.config)
 
     async def shutdown(self) -> None:
         """Shutdown device and remove the listener.
@@ -233,8 +257,42 @@ class RpcDevice:
         # refoss.GetDeviceInfo is the only RPC call that does not
         # require auth, so we must do a separate call here to get
         # the auth_domain/id so we can enable auth for the rest of the calls
-        self._refoss = await self.call_rpc("Refoss.DeviceInfo.Get")
-        if self.options.username and self.options.password:
+        # Note: On newer firmware (EM16P 3.1.11+), DeviceInfo.Get also requires auth
+        # We need to catch the auth challenge and retry with authentication
+        try:
+            self._refoss = await self.call_rpc("Refoss.DeviceInfo.Get")
+        except InvalidAuthError as err:
+            if not (self.options.username and self.options.password):
+                _LOGGER.error(
+                    "host %s:%s: Auth required but no credentials configured",
+                    self.ip_address,
+                    self.port,
+                )
+                raise
+            try:
+                challenge = json_loads(str(err))
+                realm = challenge.get("realm", "")
+                if not realm:
+                    _LOGGER.error(
+                        "host %s:%s: Auth challenge missing 'realm' field: %s",
+                        self.ip_address,
+                        self.port,
+                        challenge,
+                    )
+                    raise
+                self._wsrpc.set_auth_data(realm, self.options.username, self.options.password)
+                self._refoss = await self.call_rpc("Refoss.DeviceInfo.Get")
+            except (ValueError, KeyError) as parse_err:
+                _LOGGER.error(
+                    "host %s:%s: Failed to parse auth challenge: error=%s, raw=%s",
+                    self.ip_address,
+                    self.port,
+                    parse_err,
+                    str(err)[:200],
+                )
+                raise
+
+        if self.options.username and self.options.password and self._wsrpc._auth_data is None:
             self._wsrpc.set_auth_data(
                 self.dev_id,
                 self.options.username,
@@ -326,32 +384,32 @@ class RpcDevice:
     @property
     def dev_id(self) -> str:
         """Device uuid."""
-        return cast(str, self.refoss["dev_id"])
+        return cast(str, self.refoss.get("dev_id", ""))
 
     @property
     def mac(self) -> str:
         """Device mac."""
-        return cast(str, self.refoss["mac"])
+        return cast(str, self.refoss.get("mac", ""))
 
     @property
     def firmware_version(self) -> str:
         """Device firmware version."""
-        return cast(str, self.refoss["fw_ver"])
+        return cast(str, self.refoss.get("fw_ver", ""))
 
     @property
     def hw_version(self) -> str:
         """Device version."""
-        return cast(str, self.refoss["hw_ver"])
+        return cast(str, self.refoss.get("hw_ver", ""))
 
     @property
     def model(self) -> str:
         """Device model."""
-        return cast(str, self.refoss["model"])
+        return cast(str, self.refoss.get("model", ""))
 
     @property
     def hostname(self) -> str:
         """Device hostname."""
-        return cast(str, self.refoss["dev_id"])
+        return cast(str, self.refoss.get("dev_id", ""))
 
     @property
     def name(self) -> str:

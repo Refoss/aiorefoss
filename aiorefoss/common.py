@@ -28,7 +28,7 @@ _LOGGER = logging.getLogger(__name__)
 DEVICE_IO_TIMEOUT_CLIENT_TIMEOUT = ClientTimeout(total=DEVICE_IO_TIMEOUT)
 
 
-@dataclass
+@dataclass(slots=True)
 class ConnectionOptions:
     """Refoss options for connection."""
 
@@ -37,13 +37,13 @@ class ConnectionOptions:
     password: str | None = None
     device_mac: str | None = None
     port: int = DEFAULT_HTTP_PORT
+    auth: BasicAuth | None = None
 
     def __post_init__(self) -> None:
         """Call after initialization."""
         if self.username is not None:
             if self.password is None:
                 raise ValueError("Supply both username and password")
-
             object.__setattr__(self, "auth", BasicAuth(self.username, self.password))
 
 
@@ -75,33 +75,60 @@ async def get_info(
     port: int = DEFAULT_HTTP_PORT,
 ) -> dict[str, Any]:
     """Get info from device through REST call."""
-    error: (
-        DeviceConnectionError | DeviceConnectionTimeoutError | MacAddressMismatchError
+    url = URL.build(
+        scheme="http",
+        host=ip_address,
+        port=port,
+        path="/rpc/Refoss.DeviceInfo.Get",
     )
+
     try:
         async with aiohttp_session.get(
-            URL.build(
-                scheme="http",
-                host=ip_address,
-                port=port,
-                path="/rpc/Refoss.DeviceInfo.Get",
-            ),
+            url,
             raise_for_status=True,
             timeout=DEVICE_IO_TIMEOUT_CLIENT_TIMEOUT,
         ) as resp:
             result: dict[str, Any] = await resp.json()
     except TimeoutError as err:
         error = DeviceConnectionTimeoutError(err)
-        _LOGGER.debug("host %s:%s: timeout error: %r", ip_address, port, error)
+        _LOGGER.warning(
+            "host %s:%s: Connection timeout while fetching device info: %r",
+            ip_address,
+            port,
+            error,
+        )
         raise error from err
     except CONNECT_ERRORS as err:
         error = DeviceConnectionError(err)
-        _LOGGER.debug("host %s:%s: error: %r", ip_address, port, error)
+        _LOGGER.warning(
+            "host %s:%s: Connection error while fetching device info: %r",
+            ip_address,
+            port,
+            error,
+        )
         raise error from err
-    mac = result["mac"]
+
+    try:
+        mac = result["mac"]
+    except KeyError as err:
+        error = DeviceConnectionError(f"Device response missing 'mac' field: {result}")
+        _LOGGER.error(
+            "host %s:%s: Invalid device info response, missing mac field: %s",
+            ip_address,
+            port,
+            result,
+        )
+        raise error from err
+
     if device_mac and device_mac != mac:
         error = MacAddressMismatchError(f"Input MAC: {device_mac}, Refoss MAC: {mac}")
-        _LOGGER.debug("host %s:%s: error: %r", ip_address, port, error)
+        _LOGGER.warning(
+            "host %s:%s: MAC address mismatch: expected=%s, got=%s",
+            ip_address,
+            port,
+            device_mac,
+            mac,
+        )
         raise error
 
     return result
