@@ -253,11 +253,11 @@ class RpcDevice:
 
     async def _init_calls(self) -> None:
         """Make calls needed to initialize the device."""
-        # refoss.GetDeviceInfo is the only RPC call that does not
+        # Refoss.DeviceInfo.Get is the only RPC namespace that does not
         # require auth, so we must do a separate call here to get
-        # the auth_domain/id so we can enable auth for the rest of the calls
-        # Note: On newer firmware (EM16P 3.1.11+), DeviceInfo.Get also requires auth
-        # We need to catch the auth challenge and retry with authentication
+        # the auth_domain/id so we can enable auth for the rest of the calls.
+        # Note: On newer firmware (EM16P 3.1.11+), DeviceInfo.Get also requires auth.
+        # We need to catch the auth challenge and retry with authentication.
         try:
             self._refoss = await self.call_rpc("Refoss.DeviceInfo.Get")
         except InvalidAuthError as err:
@@ -268,30 +268,14 @@ class RpcDevice:
                     self.port,
                 )
                 raise
-            try:
-                challenge = json_loads(str(err))
-                realm = challenge.get("realm", "")
-                if not realm:
-                    _LOGGER.error(
-                        "host %s:%s: Auth challenge missing 'realm' field: %s",
-                        self.ip_address,
-                        self.port,
-                        challenge,
-                    )
-                    raise
-                self._wsrpc.set_auth_data(realm, self.options.username, self.options.password)
-                self._refoss = await self.call_rpc("Refoss.DeviceInfo.Get")
-            except (ValueError, KeyError) as parse_err:
-                _LOGGER.error(
-                    "host %s:%s: Failed to parse auth challenge: error=%s, raw=%s",
-                    self.ip_address,
-                    self.port,
-                    parse_err,
-                    str(err)[:200],
-                )
-                raise
+            await self._apply_auth_challenge(err)
+            self._refoss = await self.call_rpc("Refoss.DeviceInfo.Get")
 
-        if self.options.username and self.options.password and self._wsrpc._auth_data is None:
+        if (
+            self.options.username
+            and self.options.password
+            and not self._wsrpc.has_auth_data()
+        ):
             self._wsrpc.set_auth_data(
                 self.dev_id,
                 self.options.username,
@@ -303,15 +287,56 @@ class RpcDevice:
         if device_mac and device_mac != mac:
             raise MacAddressMismatchError(f"Input MAC: {device_mac}, refoss MAC: {mac}")
 
+        needs_status = self._status is None
         calls: list[tuple[str, dict[str, Any] | None]] = [("Refoss.Config.Get", None)]
-        if fetch_status := self._status is None:
+        if needs_status:
             calls.append(("Refoss.Status.Get", None))
 
         results = await self.call_rpc_multiple(calls, DEVICE_INIT_TIMEOUT)
 
-        self._config = results.pop(0)
-        if fetch_status:
-            self._status = results.pop(0)
+        self._config = results[0]
+        if needs_status:
+            self._status = results[1]
+
+    async def _apply_auth_challenge(self, err: InvalidAuthError) -> None:
+        """Parse an auth challenge from ``err`` and configure the WsRPC client.
+
+        Raises ``InvalidAuthError`` if the challenge cannot be parsed or is
+        missing required fields.
+        """
+        try:
+            challenge = json_loads(str(err))
+            realm = challenge.get("realm", "")
+            nonce = challenge.get("nonce")
+            nc = challenge.get("nc", 1)
+        except (ValueError, KeyError, AttributeError) as parse_err:
+            _LOGGER.error(
+                "host %s:%s: Failed to parse auth challenge: error=%s, raw=%s",
+                self.ip_address,
+                self.port,
+                parse_err,
+                str(err)[:200],
+            )
+            raise InvalidAuthError(
+                f"Failed to parse auth challenge: {str(err)[:200]}"
+            ) from parse_err
+
+        if not realm or nonce is None:
+            _LOGGER.error(
+                "host %s:%s: Auth challenge missing required field: realm=%r, nonce=%r, raw=%s",
+                self.ip_address,
+                self.port,
+                realm,
+                nonce,
+                challenge,
+            )
+            raise InvalidAuthError(
+                f"Auth challenge missing required field: {challenge}"
+            ) from err
+
+        self._wsrpc.set_auth_data(
+            realm, self.options.username, self.options.password, nonce=nonce, nc=nc
+        )
 
     @property
     def requires_auth(self) -> bool:

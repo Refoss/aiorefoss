@@ -291,10 +291,27 @@ class WsRPC(WsBase):
 
         await self._client.close()
 
-    def set_auth_data(self, realm: str, username: str, password: str) -> None:
-        """Set authentication data and generate session auth."""
+    def set_auth_data(
+        self,
+        realm: str,
+        username: str,
+        password: str,
+        nonce: int | None = None,
+        nc: int = 1,
+    ) -> None:
+        """Set authentication data and generate session auth.
+
+        ``nonce``/``nc`` should come from the device's auth challenge so the
+        digest response is computed against the exact nonce the device expects.
+        When omitted, a local timestamp is used (only safe when the device
+        will re-issue a challenge anyway).
+        """
         self._auth_data = AuthData(realm, username, password)
-        self._session.auth = self._auth_data.get_auth()
+        self._session.auth = self._auth_data.get_auth(nonce, nc)
+
+    def has_auth_data(self) -> bool:
+        """Return whether authentication data has been configured."""
+        return self._auth_data is not None
 
     async def _handle_call(self, frame_id: str) -> None:
         if TYPE_CHECKING:
@@ -468,18 +485,11 @@ class WsRPC(WsBase):
                 continue
             resp = call.resolve.result()
             self._raise_for_unrecoverable_errors(resp, allow_auth_retry=True)
+            if TYPE_CHECKING:
+                assert self._auth_data is not None
             if not to_retry:
                 # Update auth from response and try with new auth data
                 # If we have multiple calls, we only need to update auth once
-                if self._auth_data is None:
-                    # This should not happen as _raise_for_unrecoverable_errors checks it
-                    # But we handle it gracefully just in case
-                    _LOGGER.error(
-                        "host %s:%s: Auth retry required but no auth data configured",
-                        self._ip_address,
-                        self._port,
-                    )
-                    raise InvalidAuthError("Authentication data not configured")
                 try:
                     auth = json_loads(resp["error"]["message"])
                     nonce = auth["nonce"]
